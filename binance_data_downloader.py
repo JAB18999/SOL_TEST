@@ -183,7 +183,51 @@ def create_exchange():
         market_type = "future"
 
     exchange = ccxt.binance(config)
-    exchange.load_markets()
+
+    if is_github_actions:
+        # data-api.binance.vision 不支持 exchangeInfo 端点，手动注入 markets
+        sol_usdt_market = {
+            "id": "SOLUSDT",
+            "symbol": "SOL/USDT",
+            "base": "SOL",
+            "quote": "USDT",
+            "baseId": "SOL",
+            "quoteId": "USDT",
+            "type": "spot",
+            "spot": True,
+            "margin": False,
+            "swap": False,
+            "future": False,
+            "option": False,
+            "active": True,
+            "contract": False,
+            "precision": {
+                "amount": 4,
+                "price": 4,
+                "cost": None,
+                "base": 8,
+                "quote": 8,
+            },
+            "limits": {
+                "leverage": {"min": None, "max": None},
+                "amount": {"min": 0.0001, "max": 9000.0},
+                "price": {"min": 0.0001, "max": 100000.0},
+                "cost": {"min": 1.0, "max": None},
+            },
+            "info": {"symbol": "SOLUSDT", "status": "TRADING"},
+        }
+        exchange.markets = {"SOL/USDT": sol_usdt_market}
+        exchange.markets_by_id = {"SOLUSDT": sol_usdt_market}
+        exchange.symbols = ["SOL/USDT"]
+        exchange.ids = ["SOLUSDT"]
+        exchange.currencies = {
+            "SOL": {"id": "SOL", "code": "SOL", "name": "Solana", "active": True},
+            "USDT": {"id": "USDT", "code": "USDT", "name": "Tether", "active": True},
+        }
+        logger.info("手动注入 markets (跳过 exchangeInfo): SOL/USDT")
+    else:
+        exchange.load_markets()
+
     logger.info(
         f"交易所初始化完成: {exchange.id} "
         f"(市场数: {len(exchange.markets)}, 类型: {market_type})"
