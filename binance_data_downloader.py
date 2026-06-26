@@ -154,18 +154,40 @@ class BinanceAntiBan:
 # ============================================================
 
 def create_exchange():
-    """创建 CCXT Binance 永续合约实例 (含防封配置)"""
-    exchange = ccxt.binance({
+    """创建 CCXT Binance 实例 (含防封配置 + GitHub Actions 兼容)"""
+    is_github_actions = os.environ.get("GITHUB_ACTIONS") == "true"
+
+    config = {
         "enableRateLimit": True,
         "rateLimit": RATE_LIMIT_MS,
         "timeout": 30000,
         "options": {
-            "defaultType": "future",
             "adjustForTimeDifference": True,
         },
-    })
+    }
+
+    if is_github_actions:
+        # GitHub Actions runner 在美国，Binance 对美国 IP 有限制
+        # 使用 data-api.binance.vision (币安公开数据 API，不受地域限制)
+        logger.info("检测到 GitHub Actions 环境，使用 data-api.binance.vision")
+        config["urls"] = {
+            "api": {
+                "public": "https://data-api.binance.vision/api",
+                "private": "https://data-api.binance.vision/api",
+            }
+        }
+        config["options"]["defaultType"] = "spot"
+        market_type = "spot"
+    else:
+        config["options"]["defaultType"] = "future"
+        market_type = "future"
+
+    exchange = ccxt.binance(config)
     exchange.load_markets()
-    logger.info(f"交易所初始化完成: {exchange.id} (市场数: {len(exchange.markets)})")
+    logger.info(
+        f"交易所初始化完成: {exchange.id} "
+        f"(市场数: {len(exchange.markets)}, 类型: {market_type})"
+    )
     return exchange
 
 
@@ -444,18 +466,23 @@ def main():
     since_ms = int(since_dt.timestamp() * 1000)
     until_ms = int(now.timestamp() * 1000)
 
+    # 初始化交易所和防封管理器
+    exchange = create_exchange()
+    anti_ban = BinanceAntiBan(exchange)
+
+    # 检测市场类型 (本地=永续合约, GitHub Actions=现货)
+    market_type = exchange.options.get("defaultType", "spot")
+    is_future = market_type == "future"
+    market_type_label = "永续合约" if is_future else "现货 (GitHub Actions 兼容模式)"
+
     logger.info("=" * 60)
     logger.info(f"Binance SOLUSDT 数据下载器")
-    logger.info(f"交易对: {SYMBOL} (永续合约)")
+    logger.info(f"交易对: {SYMBOL} ({market_type_label})")
     logger.info(f"K线周期: {', '.join(TIMEFRAMES)}")
     logger.info(f"时间范围: {since_dt.strftime('%Y-%m-%d')} ~ {now.strftime('%Y-%m-%d')} ({DAYS}天)")
     logger.info(f"请求间隔: {RATE_LIMIT_MS}ms | 最大重试: {MAX_RETRIES}次")
     logger.info(f"数据目录: {DATA_DIR.absolute()}")
     logger.info("=" * 60)
-
-    # 初始化交易所和防封管理器
-    exchange = create_exchange()
-    anti_ban = BinanceAntiBan(exchange)
 
     start_total = time.time()
 
@@ -477,53 +504,55 @@ def main():
             logger.error(f"{tf} K线下载异常: {e}")
 
     # ----------------------------------------------------------
-    # 2. 下载资金费率历史
+    # 2. 下载合约特有衍生数据 (仅永续合约模式)
     # ----------------------------------------------------------
     derived_dir = DATA_DIR / "derived"
     derived_dir.mkdir(parents=True, exist_ok=True)
 
-    funding_data = fetch_funding_rate_history(exchange, SYMBOL, since_ms, until_ms, anti_ban)
-    if funding_data:
-        save_json(funding_data, derived_dir / "funding_rate_history.json")
-        # 同时保存为 CSV 方便分析
-        df_funding = pd.DataFrame(funding_data)
-        if "timestamp" in df_funding.columns:
-            df_funding["datetime"] = pd.to_datetime(df_funding["timestamp"], unit="ms", utc=True)
-        save_dataframe(df_funding, derived_dir / "funding_rate_history.csv")
+    if is_future:
+        # 2a. 资金费率历史
+        funding_data = fetch_funding_rate_history(exchange, SYMBOL, since_ms, until_ms, anti_ban)
+        if funding_data:
+            save_json(funding_data, derived_dir / "funding_rate_history.json")
+            df_funding = pd.DataFrame(funding_data)
+            if "timestamp" in df_funding.columns:
+                df_funding["datetime"] = pd.to_datetime(df_funding["timestamp"], unit="ms", utc=True)
+            save_dataframe(df_funding, derived_dir / "funding_rate_history.csv")
 
-    # ----------------------------------------------------------
-    # 3. 下载未平仓合约历史 (使用1h周期)
-    # ----------------------------------------------------------
-    oi_timeframes = ["1h", "2h"]
-    for tf in oi_timeframes:
-        oi_data = fetch_open_interest_history(exchange, SYMBOL, tf, since_ms, until_ms, anti_ban)
-        if oi_data:
-            save_json(oi_data, derived_dir / f"open_interest_history_{tf}.json")
-            df_oi = pd.DataFrame(oi_data)
-            if "timestamp" in df_oi.columns:
-                df_oi["datetime"] = pd.to_datetime(df_oi["timestamp"], unit="ms", utc=True)
-            save_dataframe(df_oi, derived_dir / f"open_interest_history_{tf}.csv")
+        # 2b. 未平仓合约历史 (使用1h周期)
+        oi_timeframes = ["1h", "2h"]
+        for tf in oi_timeframes:
+            oi_data = fetch_open_interest_history(exchange, SYMBOL, tf, since_ms, until_ms, anti_ban)
+            if oi_data:
+                save_json(oi_data, derived_dir / f"open_interest_history_{tf}.json")
+                df_oi = pd.DataFrame(oi_data)
+                if "timestamp" in df_oi.columns:
+                    df_oi["datetime"] = pd.to_datetime(df_oi["timestamp"], unit="ms", utc=True)
+                save_dataframe(df_oi, derived_dir / f"open_interest_history_{tf}.csv")
 
-    # ----------------------------------------------------------
-    # 4. 下载多空比历史 (使用1h和4h周期)
-    # ----------------------------------------------------------
-    ls_timeframes = ["1h", "4h"]
-    for tf in ls_timeframes:
-        acc_data, pos_data = fetch_long_short_ratio_history(
-            exchange, SYMBOL, tf, since_ms, until_ms, anti_ban
+        # 2c. 多空比历史 (使用1h和4h周期)
+        ls_timeframes = ["1h", "4h"]
+        for tf in ls_timeframes:
+            acc_data, pos_data = fetch_long_short_ratio_history(
+                exchange, SYMBOL, tf, since_ms, until_ms, anti_ban
+            )
+            if acc_data:
+                save_json(acc_data, derived_dir / f"long_short_account_{tf}.json")
+                df_acc = pd.DataFrame(acc_data)
+                if "timestamp" in df_acc.columns:
+                    df_acc["datetime"] = pd.to_datetime(df_acc["timestamp"], unit="ms", utc=True)
+                save_dataframe(df_acc, derived_dir / f"long_short_account_{tf}.csv")
+            if pos_data:
+                save_json(pos_data, derived_dir / f"long_short_position_{tf}.json")
+                df_pos = pd.DataFrame(pos_data)
+                if "timestamp" in df_pos.columns:
+                    df_pos["datetime"] = pd.to_datetime(df_pos["timestamp"], unit="ms", utc=True)
+                save_dataframe(df_pos, derived_dir / f"long_short_position_{tf}.csv")
+    else:
+        logger.info(
+            "当前使用现货模式 (data-api.binance.vision)，"
+            "跳过合约特有数据: 资金费率 / 未平仓合约 / 多空比"
         )
-        if acc_data:
-            save_json(acc_data, derived_dir / f"long_short_account_{tf}.json")
-            df_acc = pd.DataFrame(acc_data)
-            if "timestamp" in df_acc.columns:
-                df_acc["datetime"] = pd.to_datetime(df_acc["timestamp"], unit="ms", utc=True)
-            save_dataframe(df_acc, derived_dir / f"long_short_account_{tf}.csv")
-        if pos_data:
-            save_json(pos_data, derived_dir / f"long_short_position_{tf}.json")
-            df_pos = pd.DataFrame(pos_data)
-            if "timestamp" in df_pos.columns:
-                df_pos["datetime"] = pd.to_datetime(df_pos["timestamp"], unit="ms", utc=True)
-            save_dataframe(df_pos, derived_dir / f"long_short_position_{tf}.csv")
 
     # ----------------------------------------------------------
     # 5. 下载 Ticker 快照 (24h 统计)
