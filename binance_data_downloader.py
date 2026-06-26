@@ -48,6 +48,9 @@ WEIGHT_COOLDOWN_SEC = 30       # 权重冷却时间 (秒)
 # ============================================================
 # 日志配置
 # ============================================================
+# 确保数据目录存在 (FileHandler 需要目录已存在)
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -156,6 +159,8 @@ class BinanceAntiBan:
 def create_exchange():
     """创建 CCXT Binance 实例 (含防封配置 + GitHub Actions 兼容)"""
     is_github_actions = os.environ.get("GITHUB_ACTIONS") == "true"
+    force_data_api = os.environ.get("USE_DATA_API", "").lower() in ("1", "true", "yes")
+    use_data_api = is_github_actions or force_data_api
 
     config = {
         "enableRateLimit": True,
@@ -166,14 +171,17 @@ def create_exchange():
         },
     }
 
-    if is_github_actions:
+    if use_data_api:
         # GitHub Actions runner 在美国，Binance 对美国 IP 有限制
         # 使用 data-api.binance.vision (币安公开数据 API，不受地域限制)
-        logger.info("检测到 GitHub Actions 环境，使用 data-api.binance.vision")
+        if is_github_actions:
+            logger.info("检测到 GitHub Actions 环境，使用 data-api.binance.vision")
+        else:
+            logger.info("强制使用 data-api.binance.vision (USE_DATA_API=1)")
         config["urls"] = {
             "api": {
-                "public": "https://data-api.binance.vision/api",
-                "private": "https://data-api.binance.vision/api",
+                "public": "https://data-api.binance.vision/api/v3",
+                "private": "https://data-api.binance.vision/api/v3",
             }
         }
         config["options"]["defaultType"] = "spot"
@@ -184,7 +192,7 @@ def create_exchange():
 
     exchange = ccxt.binance(config)
 
-    if is_github_actions:
+    if use_data_api:
         # data-api.binance.vision 不支持 exchangeInfo 端点，手动注入 markets
         sol_usdt_market = {
             "id": "SOLUSDT",
@@ -215,6 +223,11 @@ def create_exchange():
                 "cost": {"min": 1.0, "max": None},
             },
             "info": {"symbol": "SOLUSDT", "status": "TRADING"},
+            "inverse": False,
+            "linear": False,
+            "contractSize": None,
+            "settle": None,
+            "settleId": None,
         }
         exchange.markets = {"SOL/USDT": sol_usdt_market}
         exchange.markets_by_id = {"SOLUSDT": sol_usdt_market}
